@@ -20,10 +20,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/datawire/ambassador/pkg/k8s"
-	"github.com/datawire/ambassador/pkg/supervisor"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+
+	"github.com/datawire/ambassador/pkg/helm"
+	"github.com/datawire/ambassador/pkg/k8s"
+	"github.com/datawire/ambassador/pkg/supervisor"
 )
 
 func aesInstallCmd() *cobra.Command {
@@ -382,40 +384,11 @@ func (i *Installer) Perform(kcontext string) error {
 		return fmt.Errorf(noCluster)
 	}
 
-	// Allow overriding the source domain (e.g., for smoke tests before release)
-	manifestsDomain := "www.getambassador.io"
-	domainOverrideVar := "AES_MANIFESTS_DOMAIN"
-	overrideMessage := "Downloading manifests from override domain %q instead of default %q because the environment variable %s is set."
-	if amd := os.Getenv(domainOverrideVar); amd != "" {
-		i.ShowWrapped(fmt.Sprintf(overrideMessage, amd, manifestsDomain, domainOverrideVar))
-		manifestsDomain = amd
-	}
-
-	// Download AES manifests
-	crdManifests, err := getManifest(fmt.Sprintf("https://%s/yaml/aes-crds.yaml", manifestsDomain))
+	namespace, err := i.kubeinfo.Namespace()
 	if err != nil {
-		i.Report("fail_no_internet", ScoutMeta{"err", err.Error()})
-		return errors.Wrap(err, "download AES CRD manifests")
+		i.Report("fail_no_cluster")
+		return fmt.Errorf(noCluster)
 	}
-	aesManifests, err := getManifest(fmt.Sprintf("https://%s/yaml/aes.yaml", manifestsDomain))
-	if err != nil {
-		i.Report("fail_no_internet", ScoutMeta{"err", err.Error()})
-		return errors.Wrap(err, "download AES manifests")
-	}
-
-	// Figure out what version of AES is being installed
-	aesVersionRE := regexp.MustCompile("image: quay[.]io/datawire/aes:([[:^space:]]+)[[:space:]]")
-	matches := aesVersionRE.FindStringSubmatch(aesManifests)
-	if len(matches) != 2 {
-		i.log.Printf("matches is %+v", matches)
-		i.Report("fail_bad_manifests")
-		return errors.Errorf("Failed to parse downloaded manifests. Is there a proxy server interfering with HTTP downloads?")
-	}
-	aesVersion := matches[1]
-	i.SetMetadatum("AES version being installed", "aes_version", aesVersion)
-
-	// Display version information
-	i.ShowWrapped(fmt.Sprintf("-> Installing the Ambassador Edge Stack %s.", aesVersion))
 
 	// Try to determine cluster type from node labels
 	isKnownLocalCluster := false
@@ -430,6 +403,9 @@ func (i *Installer) Perform(kcontext string) error {
 		} else if strings.Contains(clusterNodeLabels, "kind") {
 			clusterInfo = "kind"
 			isKnownLocalCluster = true
+		} else if strings.Contains(clusterNodeLabels, "k3d") {
+			clusterInfo = "k3d"
+			isKnownLocalCluster = true
 		} else if strings.Contains(clusterNodeLabels, "gke") {
 			clusterInfo = "gke"
 		} else if strings.Contains(clusterNodeLabels, "aks") {
@@ -442,106 +418,90 @@ func (i *Installer) Perform(kcontext string) error {
 		i.SetMetadatum("Cluster Info", "cluster_info", clusterInfo)
 	}
 
-	// Find existing AES CRDs
-	aesCrds, err := i.GetAESCRDs()
+	i.SetMetadatum("Cluster Info", "managed", "helm")
+
+	// create a new parsed checker for versions
+	chartVersion, err := helm.NewChartVersionRule("*")
 	if err != nil {
-		i.show.Println("Failed to get existing CRDs:", err)
-		aesCrds = []string{}
-		// Things will likely fail when we try to apply CRDs
-	}
-
-	// Figure out whether we need to apply the manifests
-	// TODO: Parse the downloaded manifests and look for specific CRDs.
-	// Installed CRDs may be out of date or incomplete (e.g., if there's an
-	// OSS installation present).
-	alreadyApplied := false
-	if len(aesCrds) > 0 {
-		// AES CRDs exist so there is likely an existing installation. Try to
-		// verify the existence of an Ambassador deployment in the Ambassador
-		// namespace.
-		installedVersion, err := i.GetInstalledImageVersion()
-		if err != nil {
-			i.show.Println("Failed to look for an existing installation:", err)
-			installedVersion = ""
-			// Things will likely fail when we try to apply manifests
-		}
-		switch {
-		case aesVersion == installedVersion:
-			alreadyApplied = true
-			i.ShowWrapped(fmt.Sprintf("-> Found an existing installation of Ambassador Edge Stack %s.", aesVersion))
-		case installedVersion != "":
-			i.ShowWrapped(fmt.Sprintf("-> Found an existing installation of Ambassador Edge Stack %s.", installedVersion))
-			i.show.Println()
-			i.ShowWrapped(abortExisting)
-			i.show.Println()
-			i.ShowWrapped(seeDocs)
-			i.Report("fail_existing_aes", ScoutMeta{"installing", aesVersion}, ScoutMeta{"found", installedVersion})
-			return errors.Errorf("existing AES %s found when installing AES %s", installedVersion, aesVersion)
-		default:
-			i.ShowWrapped(abortCRDs)
-			i.show.Println()
-			i.ShowWrapped(seeDocs)
-			i.Report("fail_existing_crds")
-			return errors.New("CRDs found")
-		}
-	}
-
-	if !alreadyApplied {
-		// Install the AES manifests
-
-		i.ShowWrapped("Downloading images. (This may take a minute.)")
-
-		if err := i.ShowKubectl("install CRDs", crdManifests, "apply", "-f", "-"); err != nil {
-			i.Report("fail_install_crds")
-			return err
-		}
-
-		if err := i.ShowKubectl("wait for CRDs", "", "wait", "--for", "condition=established", "--timeout=90s", "crd", "-lproduct=aes"); err != nil {
-			i.Report("fail_wait_crds")
-			return err
-		}
-
-		if err := i.ShowKubectl("install AES", aesManifests, "apply", "-f", "-"); err != nil {
-			i.Report("fail_install_aes")
-			return err
-		}
-
-		if err := i.ShowKubectl("wait for AES", "", "-n", "ambassador", "wait", "--for", "condition=available", "--timeout=90s", "deploy", "-lproduct=aes"); err != nil {
-			i.Report("fail_wait_aes")
-			return err
-		}
-	}
-
-	// Wait for Ambassador Pod; grab AES install ID
-	if err := i.loopUntil("AES pod startup", i.GrabAESInstallID, lc2); err != nil {
-		i.Report("fail_pod_timeout")
 		return err
 	}
 
-	// Grab Helm information if present
-	if managedDeployment, err := i.CaptureKubectl("get deployment labels", "", "get", "-n", "ambassador", "deployments", "ambassador", "-Lapp.kubernetes.io/managed-by"); err == nil {
-		if strings.Contains(managedDeployment, "Helm") {
-			i.SetMetadatum("Cluster Info", "managed", "helm")
-		}
+	options := helm.HelmManagerOptions{
+		Version: chartVersion,
+		Logger:  i.log,
 	}
 
-	i.Report("deploy")
+	chartValues := map[string]string{} // TODO: set any Helm values we want to override,
+
+	// create a new manager for the remote Helm repo URL
+	chartDown, err := helm.NewHelmDownloader(options)
+	if err != nil {
+		return err
+	}
+
+	i.ShowWrapped(fmt.Sprintf("-> Checking latest version of Ambassador Edge Stack available..."))
+
+	if err := chartDown.Download(); err != nil {
+		i.ShowWrapped(fmt.Sprintf("-> Failed to download Ambassador Edge Stack"), tryAgain, seeDocs)
+		i.Report("fail_download", ScoutMeta{"err", err.Error()})
+		return errors.Errorf("could not download")
+	}
+
+	// the AES version we have downloaded
+	downVersion := strings.Trim(chartDown.GetChart().AppVersion, "\n")
+
+	chartRel, err := chartDown.GetReleaseMgr(namespace, chartValues)
+	defer func() { _ = chartDown.Cleanup() }()
+	if err != nil {
+		i.log.Printf("when obtaining the chart manager: %w", err)
+		return err
+	}
+
+	if err := chartRel.Sync(i.ctx); err != nil {
+		i.log.Printf("Failed to sync release: %w", err)
+		return err
+	}
+
+	if !chartRel.IsInstalled() {
+		// First case: Ambassador is not installed at all: perform the installation
+
+		i.SetMetadatum("AES version being installed", "aes_version", downVersion)
+
+		// Display version information
+		i.ShowWrapped(fmt.Sprintf("-> Installing the Ambassador Edge Stack %s.", downVersion))
+		installedRelease, err := chartRel.InstallRelease(i.ctx)
+		if err != nil {
+			i.log.Printf("Installation of a new release failed: %w", err)
+			return err
+		}
+
+		i.log.Printf("New release installed successfully")
+		i.log.Printf("Config values: %+v", installedRelease.Config)
+
+		message := ""
+		if installedRelease.Info != nil {
+			message = installedRelease.Info.Notes
+		}
+		i.ShowWrapped(message, "\n")
+		i.Report("deploy")
+
+	} else {
+		// Third case: Ambassador is currently installed. Don't do anything.
+		i.ShowWrapped(fmt.Sprintf("-> Found an existing installation of Ambassador Edge Stack %s.", downVersion))
+		i.ShowWrapped("-> ... will not try to install/update Ambassador")
+		i.Report("installed")
+	}
 
 	// Don't proceed any further if we know we are using a local (not publicly
 	// accessible) cluster. There's no point wasting the user's time on
 	// timeouts.
 	if isKnownLocalCluster {
 		i.Report("cluster_not_accessible")
-		i.show.Println("-> Local cluster detected. Not configuring automatic TLS.")
-		i.show.Println()
-		i.ShowWrapped(noTlsSuccess)
-		i.show.Println()
+		i.ShowWrapped("-> Local cluster detected. Not configuring automatic TLS.", "\n", noTlsSuccess, "\n")
 		loginMsg := "Determine the IP address and port number of your Ambassador service.\n"
 		loginMsg += "(e.g., minikube service -n ambassador ambassador)\n"
 		loginMsg += fmt.Sprintf(loginViaIP, "IP_ADDRESS:PORT")
-		i.ShowWrapped(loginMsg)
-		i.show.Println()
-		i.ShowWrapped(seeDocs)
+		i.ShowWrapped(loginMsg, "\n", seeDocs)
 		return nil
 	}
 
@@ -594,7 +554,7 @@ func (i *Installer) Perform(kcontext string) error {
 	i.show.Println()
 	i.ShowWrapped(emailAsk)
 	// Do the goroutine dance to let the user hit Ctrl-C at the email prompt
-	gotEmail := make(chan (string))
+	gotEmail := make(chan string)
 	var emailAddress string
 	go func() {
 		gotEmail <- getEmailAddress(defaultEmail, i.log)
@@ -747,11 +707,17 @@ func (i *Installer) Quit() {
 	i.cancel()
 }
 
-func (i *Installer) ShowWrapped(text string) {
-	text = strings.Trim(text, "\n")                  // Drop leading and trailing newlines
-	for _, para := range strings.Split(text, "\n") { // Preserve newlines in the text
-		for _, line := range doWordWrap(para, "", 79) { // But wrap text too
-			i.show.Println(line)
+func (i *Installer) ShowWrapped(texts ...string) {
+	for _, text := range texts {
+		if text == "\n" {
+			i.show.Println()
+		} else {
+			text = strings.Trim(text, "\n")                  // Drop leading and trailing newlines
+			for _, para := range strings.Split(text, "\n") { // Preserve newlines in the text
+				for _, line := range doWordWrap(para, "", 79) { // But wrap text too
+					i.show.Println(line)
+				}
+			}
 		}
 	}
 }
